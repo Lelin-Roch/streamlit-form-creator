@@ -59,55 +59,138 @@ def clear_credentials_file():
     if os.path.exists(CREDENTIALS_CACHE_FILE):
         os.remove(CREDENTIALS_CACHE_FILE)
 
-# --- Question Parser ---
+# --- Combined Question Parser ---
 def parse_questions(text):
     questions = []
-    q_blocks = re.split(r'\n(?=\d+\.\s)', text)
-    for block in q_blocks:
-        lines = [line.strip() for line in block.strip().split("\n") if line.strip()]
+    blocks = re.split(r'\n(?=\d+\.\s)', text.strip())  # Split by numbered questions
+
+    for block in blocks:
+        lines = block.strip().split('\n')
         if not lines:
             continue
 
-        q_match = re.match(r"\d+\.\s*(.*)", lines[0])
-        question_text = q_match.group(1).strip() if q_match else lines[0]
+        question_line = lines[0].strip()
+        question_text = re.sub(r"^\d+\.\s*", "", question_line)
+
+        code_lines = []
         options = []
         correct_answers = []
         qtype = None
         points = 0
+        has_lettered_option = False
+        has_any_options = False
+        i = 1
 
-        for line in lines[1:]:
-            opt_match = re.match(r"[A-D]\)\s*(.*)", line)
-            if opt_match:
-                options.append(opt_match.group(1).strip())
-            elif "CORRECT ANSWER:" in line.upper():
-                parts = line.split(":")[-1].strip().split(",")
-                for p in parts:
-                    p = p.strip().upper()
-                    if re.match(r"^[A-D]$", p) and options:
-                        index = ord(p) - ord("A")
-                        if index < len(options):
-                            correct_answers.append(options[index])
-                    else:
-                        correct_answers.append(p)
-            elif "TYPE:" in line.upper():
-                qtype = line.split(":")[-1].strip().upper()
-            elif "POINTS:" in line.upper():
-                points = int(line.split(":")[-1].strip())
+        # Collect code/description lines
+        while i < len(lines):
+            line = lines[i].strip()
+            if re.match(r"^([*]?\s*✅?\s*)?[A-D]\)", line):  # A) option format
+                has_lettered_option = True
+                has_any_options = True
+                break
+            if re.match(r"^\*+\s*", line):  # * option format
+                has_any_options = True
+                break
+            if re.match(r"^✅", line):  # ✅ Option format (no A-D)
+                has_any_options = True
+                break
+            if "CORRECT ANSWER" in line.upper():
+                break
+            if "TYPE:" in line.upper() or "POINTS:" in line.upper():
+                break
+            code_lines.append(lines[i])  # Preserve original spacing
+            i += 1
 
+        code_block = "\n".join(code_lines)
+        is_code_like = any(x in code_block for x in ["=", ":", "def", "{", "}", "return", "print", "import"])
+        has_code = bool(code_block.strip()) and is_code_like
+        description = code_block if has_code else ""
+
+        # Collect options
+        while i < len(lines):
+            raw_line = lines[i].strip()
+            if not raw_line:
+                i += 1
+                continue
+
+            if "CORRECT ANSWER" in raw_line.upper():
+                letters = raw_line.split(":")[-1].strip().split(",")
+                for letter in letters:
+                    for opt in options:
+                        if opt.startswith(f"{letter.strip().upper()})"):
+                            correct_answers.append(opt)
+                i += 1
+                continue
+
+            if "TYPE:" in raw_line.upper():
+                qtype = raw_line.split(":")[-1].strip().upper()
+                i += 1
+                continue
+
+            if "POINTS:" in raw_line.upper():
+                try:
+                    points = int(raw_line.split(":")[-1].strip())
+                except:
+                    points = 0
+                i += 1
+                continue
+
+            line = raw_line.lstrip("*").strip()
+            is_correct = False
+
+            if line.startswith("✅"):
+                is_correct = True
+                line = line.replace("✅", "", 1).strip()
+
+            match = re.match(r"^([A-D])\)\s*(.*)", line)
+            if match:
+                letter = match.group(1)
+                text = match.group(2).strip()
+                full_option = f"{letter}) {text}"
+                options.append(full_option)
+                if is_correct:
+                    correct_answers.append(full_option)
+                has_lettered_option = True
+                has_any_options = True
+            elif line:
+                options.append(line)
+                if is_correct:
+                    correct_answers.append(line)
+                has_any_options = True
+
+            i += 1
+
+        # Infer type
         if not qtype:
             if options:
                 qtype = "CHECKBOX" if len(correct_answers) > 1 else "MCQ"
             else:
                 qtype = "SHORT"
 
-        questions.append({
+        # Fallback to SHORT if it looks like options but none are marked properly
+        if not has_code and options and not correct_answers and not has_lettered_option:
+            return_type = "SHORT"
+            return_description = "\n".join([f"- {opt}" for opt in options])
+            return_options = []
+        else:
+            return_type = qtype
+            return_description = description
+            return_options = options
+
+        question_data = {
             "question": question_text,
-            "type": qtype,
-            "options": options,
+            "type": return_type,
+            "options": return_options,
             "correct_answers": correct_answers,
-            "points": points
-        })
+            "points": points,
+            "description": return_description.strip()
+        }
+
+        questions.append(question_data)
+
     return questions
+
+
 
 # --- Form Generator ---
 def create_google_form(creds, parsed_questions, shuffle=False, form_id=None, quiz_mode=False):
@@ -138,8 +221,21 @@ def create_google_form(creds, parsed_questions, shuffle=False, form_id=None, qui
         })
 
     for q in parsed_questions[::-1]:
+        # Split title and code block
+        if "\n" in q["question"]:
+            parts = q["question"].split("\n", 1)
+            title = parts[0].strip()
+            description = parts[1]  # Preserve formatting
+        else:
+            title = q["question"].strip()
+            description = q.get("description", "")  # fallback if needed
+
+        # Only sanitize title
+        title = title.replace("\n", " ")
+
         item = {
-            "title": q["question"],
+            "title": title,
+            "description": description,
             "questionItem": {
                 "question": {
                     "required": True
@@ -167,6 +263,7 @@ def create_google_form(creds, parsed_questions, shuffle=False, form_id=None, qui
         elif q["type"] == "TIME":
             item["questionItem"]["question"]["timeQuestion"] = {}
 
+        # Add question creation request
         requests.append({
             "createItem": {
                 "item": item,
@@ -174,6 +271,7 @@ def create_google_form(creds, parsed_questions, shuffle=False, form_id=None, qui
             }
         })
 
+        # Add grading request if needed
         if quiz_mode and q["correct_answers"] and q["type"] in ["MCQ", "CHECKBOX"]:
             correct_answers = q["correct_answers"]
             points = q["points"] if q["points"] else 1
@@ -271,7 +369,9 @@ def main():
             creds = flow.credentials
             st.session_state.credentials = json.loads(creds.to_json())
             save_credentials_to_file(creds)
+            st.query_params.clear()  # ✅ Clears the ?code=...&state=...
             st.rerun()
+            
         except Exception as e:
             st.error(f"Login failed: {e}")
             st.text(traceback.format_exc())
@@ -320,9 +420,17 @@ def main():
                     for i, q in enumerate(questions):
                         st.markdown(f"---\n**Q{i+1}: {q['question']}**")
 
-                        if q["type"] in ["MCQ", "CHECKBOX", "DROPDOWN"]:
+        # Show description/code block if available
+                        if q["description"]:
+                            st.code(q["description"], language="python")
+
+        # Show options with correct answers highlighted
+                        if q["type"] in ["MCQ", "CHECKBOX", "DROPDOWN"] and q["options"]:
                             for opt in q["options"]:
-                                st.markdown(f"- 🔘 {opt}")
+                                if opt in q["correct_answers"]:
+                                    st.markdown(f"- ✅ <span style='color:green'><b>{opt}</b></span>", unsafe_allow_html=True)
+                                else:
+                                    st.markdown(f"- 🔘 {opt}")
                         elif q["type"] == "SHORT":
                             st.markdown("- ✏️ Short Answer")
                         elif q["type"] == "LONG":
@@ -332,6 +440,7 @@ def main():
                         elif q["type"] == "TIME":
                             st.markdown("- ⏰ Time")
 
+        # Points input (if quiz mode is ON)
                         if quiz_mode:
                             questions[i]["points"] = st.number_input(
                                 f"Points for Q{i+1}",
@@ -341,7 +450,7 @@ def main():
                                 key=f"points_{i}"
                             )
                         else:
-                            questions[i]["points"] = 0  # Set 0 if quiz mode is off
+                            questions[i]["points"] = 0# Set 0 if quiz mode is off
 
                 shuffle = st.checkbox("🔀 Shuffle answer options", value=False)
 
@@ -358,10 +467,13 @@ def main():
             else:
                 st.warning("⚠️ No valid questions found in the input.")
 
-        if st.button("🔓 Logout"):
+        if st.button("🔓 Logout", key="logout_btn"):
             st.session_state.credentials = None
             clear_credentials_file()
+            st.query_params.clear()  # ✅ Clears old ?code=...&state=...
             st.rerun()
+
 
 if __name__ == "__main__":
     main()
+
